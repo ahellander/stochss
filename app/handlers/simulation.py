@@ -8,18 +8,29 @@ import tempfile,sys
 from google.appengine.ext import db
 import pickle
 import threading
+import random
+import subprocess
 import traceback
 import logging
+import boto
+from boto.dynamodb import condition
 from google.appengine.api import users
 
 from stochss.model import *
 from stochss.stochkit import *
 
 from stochssapp import BaseHandler
-from stochssapp import StochKitModelWrapper
-from stochssapp import ObjectProperty
+from modeleditor import StochKitModelWrapper
+
+import modeleditor
 
 from backend.backendservice import backendservices
+
+from s3_helper import *
+
+import exportimport
+
+import time
 
 import os, shutil
 import random
@@ -32,377 +43,518 @@ except ImportError:
 jinja_environment = jinja2.Environment(autoescape=True,
                                        loader=(jinja2.FileSystemLoader(os.path.join(os.path.dirname(__file__), '../templates'))))
 
-
-class JobWrapper(db.Model):
-    """ A wrapper around the Job object """
-    # user_id =  db.StringProperty()
-    # job_id = db.StringProperty()
-    # job_type = db.StringProperty()
-    # job = ObjectProperty()
-
-class Job():
-    """ Representation of a Job in StochSS. A Job consists of a collection of Tasks. """
-
-    def __init__(self):
-        # tasks is a dict where the task_id is key and a task object is the value. 
-        self.tasks = {}
-
-class Task():
-    """ Representation of a Task in StochSS """
-
-    def __init__(self,task_id = None):
-        self.task_id = task_id
+from db_models.stochkit_job import StochKitJobWrapper
 
 
-class StochKitJobWrapper(db.Model):
-    # A reference to the user that owns this job
-    user_id =  db.StringProperty()
-    name = db.StringProperty()
-    # The type if the job {'local', 'cloud'}
-    type =  db.StringProperty()
-    stochkit_job = ObjectProperty()
+class JobManager():
+    @staticmethod
+    def getJobs(handler):
+        jobs = db.GqlQuery("SELECT * FROM StochKitJobWrapper WHERE user_id = :1", handler.user.user_id()).fetch(100000)
 
-    stdout = db.StringProperty()
-    stderr = db.StringProperty()
+        output = []
 
-class StochKitJob(Job):
-    """ Model for a StochKit job. Contains all the parameters associated with the call. """
+        for job in jobs:
+            indata = json.loads(job.indata)
+
+            # type, final_time, increment, realizations, exec_type, units, store_only_mean, label_column_names,
+            #  create_histogram_data, epsilon, threshold, result
+
+            jsonJob = { "id" : job.key().id(),
+                        "name" : job.name,
+                        "stdout" : job.stdout,
+                        "stderr" : job.stderr,
+                        # These are things contained in the stochkit_job object
+                        "type" : indata["type"],
+                        "status" : job.status,
+                        "startTime" : job.startTime,
+                        "modelName" : job.modelName,
+                        "output_stored": job.output_stored,
+                        "output_location" : job.outData,
+                        "zipFileName" : job.zipFileName,
+                        "output_url" : job.outputURL,
+                        "final_time" : indata["final_time"],
+                        "increment" : indata["increment"],
+                        "realizations" : indata["realizations"],
+                        "exec_type" : indata["exec_type"],
+                        "units" : indata["units"],
+                        "resource" : indata["resource"],
+                        "epsilon" : indata["epsilon"],
+                        "threshold" : indata["threshold"],
+                        "seed" : indata["seed"],
+                        "cloudDatabaseID" : job.cloudDatabaseID,
+                        "pid" : job.pid,
+                        "result" : job.result }
+
+            output.append(jsonJob)
+
+        return output
+
+    @staticmethod
+    def getJob(handler, job_id):
+        job = StochKitJobWrapper.get_by_id(job_id)
+        indata = json.loads(job.indata)
+        logging.debug('getJob() job.id = {0} job.indata = {1}'.format(job.key().id(), indata))
+
+        jsonJob = { "id" : job.key().id(),
+                    "name" : job.name,
+                    "stdout" : job.stdout,
+                    "stderr" : job.stderr,
+                    # These are things contained in the stochkit_job object
+                    "type" : indata["type"],
+                    "status" : job.status,
+                    "startTime" : job.startTime,
+                    "modelName" : job.modelName,
+                    "output_stored": job.output_stored,
+                    "output_location" : job.outData,
+                    "zipFileName" : job.zipFileName,
+                    "output_url" : job.outputURL,
+                    "final_time" : indata["final_time"],
+                    "increment" : indata["increment"],
+                    "realizations" : indata["realizations"],
+                    "exec_type" : indata["exec_type"],
+                    "units" : indata["units"],
+                    "resource" : job.resource,
+                    "epsilon" : indata["epsilon"],
+                    "threshold" : indata["threshold"],
+                    "cloudDatabaseID" : job.cloudDatabaseID,
+                    "seed" : indata["seed"],
+                    "pid" : job.pid,
+                    "result" : job.result }
+            
+        return jsonJob
+
+    @staticmethod
+    def createJob(handler, job, rename = None):
+        tryName = job["name"]
+
+        userID = None
+
+        if 'user_id' in job:
+            userID = job['user_id']
+        else:
+            userID = handler.user.user_id()
+
+        jobNames = [x.name for x in db.Query(StochKitJobWrapper).filter('user_id =', userID).run()]
+
+        if job["name"] in jobNames:
+            if not rename:
+                return None
+            else:
+                i = 1
+                tryName = '{0}_{1}'.format(job["name"], i)
+
+                while tryName in jobNames:
+                    i = i + 1
+                    tryName = '{0}_{1}'.format(job["name"], i)
+                    
+        if rename:
+            job["name"] = tryName
+
+        jobWrap = StochKitJobWrapper()
+        jobWrap.user_id = userID
+        jobWrap.name = job['name']
+
+        if 'seed' not in job:
+            job['seed'] = -1
+        
+        jobWrap.modelName = job['modelName']
+        # This is probably not a good idea...
+        jobWrap.indata = json.dumps(dict([(k, job[k]) for k in ['type', 'final_time', 'increment', 'realizations', 'exec_type', 'units', 'epsilon', 'threshold', 'seed'] if k in job]))
+
+        if 'startTime' in job:
+            jobWrap.startTime = job['startTime']
+
+        if 'resource' in job:
+            jobWrap.resource = job['resource']
+        else:
+            jobWrap.resource = 'Local'
+
+        jobWrap.outData = job['output_location']
+
+        if 'output_url' in job:
+            jobWrap.outputURL = job['output_url']
+
+        jobWrap.stdout = job['stdout']
+        jobWrap.stderr = job['stderr']
+        if 'output_stored' in job:
+            jobWrap.output_stored = job['output_stored']
+
+        jobWrap.put()
+
+        return jobWrap.key().id()
+
+    @staticmethod
+    def deleteJob(handler, job_id):
+        job = StochKitJobWrapper.get_by_id(job_id)
+        job.delete()
+
+    @staticmethod
+    def updateJob(handler, job):
+        jobWrap = StochKitJobWrapper.get_by_id(job_id)
+        jobWrap.user_id = handler.user.user_id()
+        jobWrap.put()
+        
+        jsonJob = { "id" : jobWrap.key().id() }
+
+        return jsonJob
+
+class JobBackboneInterface(BaseHandler):
+  def get(self):
+    req = self.request.path.split('/')[-1]
     
-    def __init__(self,name=None, final_time=None, increment=None, realizations=1,algorithm='ssa',store_only_mean=False, label_column_names=True,create_histogram_data=False, seed=None, epsilon=0.1,threshold=10, output_url = None):
-        """ fdsgfhsj """
-        
-        # Type of the job {'Local','Cloud'}
-        self.type = None
-        
-        # The status of the job. Valid statuses are 'Running', 'Finished', 'Failed'
-        self.status = None
-        
-        # URL to the result (valid after a sucessful execution)
-        self.output_location = ""
-        self.output_url = output_url
-        
-        # Input parameters
-        self.name = name
-        self.final_time = final_time
-        self.increment = increment
-        self.realizations = realizations
-        self.algorithm = algorithm
-        
-        self.store_only_mean = store_only_mean
-        self.label_column_names = label_column_names
-        self.create_histogram_data = create_histogram_data
-        
-        if seed == None:
-            self.seed = int(uuid.uuid())
-        
-        self.epsilon = epsilon
-        self.threshold = threshold
-         
+    self.response.content_type = 'application/json'
     
-        # Status of the Job (Running, Pending, Done)
-        status = 'Pending'
-        #  Process ID
-        self.pid = None
-    
-        # The result dict returned by the cloud submission
-        self.result = None
-    
+    if req == 'list':
+        jobs = JobManager.getJobs(self)
+
+        self.response.write(json.dumps(jobs))
+    else:
+        job = JobManager.getJob(self, int(req))
+
+        self.response.write(json.dumps(job))
         
+  def post(self):
+      jsonJob = json.loads(self.request.body)
+      job = JobManager.createJob(self, jsonJob)
+      
+      #print 'CREATE', job["id"]
+      
+      self.response.content_type = "application/json"
+      self.response.write(json.dumps(job))
+
+  def put(self):
+      req = request.uri.split('/')[-1]
+
+      jobId = int(req)
+      jsonJob = json.loads(self.request.body)
+      job = JobManager.updateJob(self, jsonJob)
+      
+      self.response.content_type = "application/json"
+      self.response.write(json.dumps(job))
+
+  def delete(self):
+      job_id = request.uri.split('/')[-1]
+      
+      JobManager.deleteJob(self, int(job_id))
+      
+      request.setHeader("Content-Type", "application/json")
+      self.response.write(json.dumps([]))
+
 
 class SimulatePage(BaseHandler):
-    """ Render a page that lists the available models. """
+    """ Render a page that lists the available models. """    
+    def authentication_required(self):
+        return True
     
     def get(self):
-
+        all_models = []
         # Query the datastore
-        all_models_q = db.GqlQuery("SELECT * FROM StochKitModelWrapper WHERE user_id = :1", self.user.user_id())
-        all_models=[]
-        for q in all_models_q.run():
-            all_models.append(q)
-    
+        for model in modeleditor.ModelManager.getModels(self):
+            all_models.append({ "name" : model["name"],
+                                "id" : model["id"],
+                                "units" : model["units"],
+                                "isSpatial" : model["isSpatial"] })
         context = {'all_models': all_models}
+
         self.render_response('simulate.html',**context)
 
     def post(self):
-        
-        model = self.request.get('model_to_simulate')
-        if model == None or model == "":
-            self.redirect('/simulate')
-        else:
-            self.set_session_property('model_to_simulate',model)
-            self.redirect('/simulate/newstochkitensemble')
-
-
-class NewStochkitEnsemblePage(BaseHandler):
-    """ Page with a form to configure a well mixed stochastic (StochKit2) simulation job.  """
-    
-    def get(self):
-        model_to_simulate=self.get_session_property('model_to_simulate')
-        
-        # Make sure that the model is present in the datastore
-        if model_to_simulate is not None:
-            model_db = db.GqlQuery("SELECT * FROM StochKitModelWrapper WHERE user_id = :1 AND model_name = :2", self.user.user_id(),model_to_simulate).get()
-            if model_db == None:
-                self.set_session_property('model_to_simulate',None)
-                model_to_simulate = None
-
-        # If model_to_simulate has not been set using the simulation manager main page,
-        # we attempt to set it to the currently edited model
-        else:
-            model_edited = self.get_session_property('model_edited')
-            if model_edited is not None and model_edited is not "":
-                model_to_simulate = model_edited.name
-                self.set_session_property('model_to_simulate',model_to_simulate)
-    
-        # If we have not managed to identify a model to simulate, we redirect to
-        # a page where the user can select a model
-        if model_to_simulate is None:
-            self.redirect("/simulate")
-        context = {'model_to_simulate':model_to_simulate}
-        self.render_response('simulate/newstochkitensemblepage.html',**context)
-
-    def post(self):
         """ Assemble the input to StochKit2 and submit the job (locally or via cloud). """
-        
-        # Params is a dict that constains all response elements of the form
-        params = self.request.POST
-        
-        # Create a stochhkit_job instance
-        if 'run_local' in params:
-            result=self.runStochKitLocal()
-        elif 'run_cloud' in params:
-            result=self.runCloud()
-        else:
-            result={'status':False,'msg':'There was an error processing your request.'}
 
-        context = {'model_to_simulate':self.get_session_property('model_to_simulate')}
-        self.render_response('simulate/newstochkitensemblepage.html',**dict(context,**result))
+        reqType = self.request.get('reqType')
 
-    def runCloud(self):
-        
-        try:
-            # Get the model that is currently in scope for simulation via the session property 'model_to_simulate'
+        if reqType == 'getFromCloud':
+            job = StochKitJobWrapper.get_by_id(int(self.request.get('id')))
+
+            service = backendservices(self.user_data)
+            service.fetchOutput(job)
+            
+            # Unpack it to its local output location
+            os.system('tar -xf {0}.tar'.format(job.cloudDatabaseID))
+            job.outData = os.path.abspath('{0}/../output/{1}'.format(os.path.abspath(os.path.dirname(__file__)), job.cloudDatabaseID))
+
+            job.stdout = os.path.join(job.outData, '/stdout.log')
+            job.stderr = os.path.join(job.outData, '/stderr.log')
+
+            # Clean up
+            os.remove('{0}.tar'.format(job.cloudDatabaseID))
+
+            # Save the updated status
+            job.put()
+
+            self.response.headers['Content-Type'] = 'application/json'
+            self.response.write(json.dumps({ 'status' : True,
+                                             'msg' : 'Job downloaded'}))
+            return
+        elif reqType == 'getDataLocal':
+            job = StochKitJobWrapper.get_by_id(int(self.request.get('id')))
+
+            if not job.zipFileName:
+                szip = exportimport.SuperZip(os.path.abspath(os.path.dirname(__file__) + '/../static/tmp/'), preferredName = job.name + "_")
+                
+                job.zipFileName = szip.getFileName()
+
+                szip.addStochKitJob(job, globalOp = True, ignoreStatus = True)
+                
+                szip.close()
+
+                # Save the updated status
+                job.put()
+            
+            
+            relpath = os.path.relpath(job.zipFileName, os.path.abspath(os.path.dirname(__file__) + '/../'))
+
+            self.response.headers['Content-Type'] = 'application/json'
+            self.response.write(json.dumps({ 'status' : True,
+                                             'msg' : 'Job downloaded',
+                                             'url' : relpath }))
+            return
+        elif reqType == 'delJob':
             try:
-                model_to_simulate=self.get_session_property('model_to_simulate')
-                db_model = db.GqlQuery("SELECT * FROM StochKitModelWrapper WHERE user_id = :1 AND model_name = :2", self.user.user_id(),model_to_simulate).get()
-                model = db_model.model
-            except:
-                return {'status':False,'msg':'Failed to retrive the model to simulate.'}
-            
-            # Check the data from the form for errors
-            params,result = self.parseForm()
-            if not result['status']:
-                return result
-        
-            db_credentials = self.user_data.getCredentials()
-            # Set the environmental variables 
-            os.environ["AWS_ACCESS_KEY_ID"] = db_credentials['EC2_ACCESS_KEY']
-            os.environ["AWS_SECRET_ACCESS_KEY"] = db_credentials['EC2_SECRET_KEY']
+                job = StochKitJobWrapper.get_by_id(int(self.request.get('id')))
 
-            if os.environ["AWS_ACCESS_KEY_ID"] == '':
-                result = {'status':False,'msg':'Access Key not set. Check : Settings > Cloud Computing'}
-                return result
+                if job.user_id == self.user.user_id():
+                    job.delete(self)
+                    
+                self.response.headers['Content-Type'] = 'application/json'
+                self.response.write(json.dumps({ 'status' : True,
+                                                 'msg' : "Job deleted from the datastore."}))
+            except Exception as e:
+                logging.exception(e)
+                self.response.headers['Content-Type'] = 'application/json'
+                self.response.write(json.dumps({ 'status' : False,
+                                                 'msg' : "Error: {0}".format(e) }))
 
-            if os.environ["AWS_SECRET_ACCESS_KEY"] == '':
-                result = {'status':False,'msg':'Secret Key not set. Check : Settings > Cloud Computing'}
-                return result
-        
-            #the parameter dictionary to be passed to the backend
-            param = {}
-    
-            document = model.serialize()
-            params['document']=str(document)
-            print 'model serialized'
-            filepath = ""
-            params['file'] = filepath
-            ensemblename = params['job_name']
-            time = params['time']
-            realizations = params['realizations']
-            increment = params['increment']
-            seed = params['seed']
-            # Algorithm, SSA or Tau-leaping?
-            executable = params['algorithm']
+            return
+        elif reqType == 'jobInfo':
+            job = StochKitJobWrapper.get_by_id(int(self.request.get('id')))
+            indata = json.loads(job.indata)
 
-            # Assemble the argument list
-            args = ''
-            args+=' -t '
-            args+=str(time)
-            num_output_points = str(int(float(time)/float(increment)))
-            args+=' -i ' + str(num_output_points)
-            args+=' --realizations '
-            args+=str(realizations)
-            
-            # We keep all the trajectories by default. The user can select to only store means and variance
-            # through the advanced options.
-            if not "only-moments" in params:
-                args+=' --keep-trajectories'
-            
-            # Columns need to be labeled for visulatization page to work.  
-            args+=' --label'
-            
-            if "keep-histograms" in params:
-                args+=' --keep-histograms'
-                        
-            args+=' --seed '
-            args+=str(seed)
-        
-            cmd = executable+' '+args
-        
-            # Create a StochKitJob instance
-            stochkit_job = StochKitJob(name=ensemblename, final_time=time, realizations=realizations,increment=increment,seed=seed,algorithm=executable)
-        
-            params['paramstring'] = cmd
+            if self.user.user_id() != job.user_id:
+                self.response.headers['Content-Type'] = 'application/json'
+                self.response.write(json.dumps(["Not the right user"]))
 
-            bucketname = self.user_data.getBucketName()
-            params['bucketname'] = bucketname         
-        
-            # Call backendservices and execute StochKit
-            service = backendservices()
-            res,taskid = service.executeTask(params)
-            
-            if res == None:
-                result = {'status':False,'msg':'Cloud execution failed. '}
-                return result
-        
-            stochkit_job.resource = 'Cloud'
-            stochkit_job.type = 'StochKit2 Ensemble'
-            
-            # The jobs pid is the Celery task id.
-            stochkit_job.pid = taskid
-            stochkit_job.status = 'Running'
-        
-            # Create a wrapper to store the Job description in the datastore
-            stochkit_job_db = StochKitJobWrapper()
-            stochkit_job_db.user_id = self.user.user_id()
-            stochkit_job_db.name = stochkit_job.name
-            stochkit_job_db.stochkit_job = stochkit_job
-            stochkit_job_db.put()
-            result = {'status':True,'msg':'Job submitted sucessfully.'}
-                
-        except Exception,e:
-            result = {'status':False,'msg':'Cloud execution failed: '+str(e)}       
-        return result
-        
-    def parseForm(self):
-        """ 
-            Parses the StochKit2 Ensemble job submission form.
-            Returns a tuple of dicts (params, result) where params contain
-            the StochKit job parameters and result contains the status and a sucess or error message.
-            
-        """
-        params = {}
-        result = {}
-        result['status']=True
-        result['msg']=''
-        
-        par = self.request.POST
-        
-        # Check the name of the simulation, make sure that no simulation with that name exists in the system
-        name = par['job_name']
-        model = db.GqlQuery("SELECT * FROM StochKitJobWrapper WHERE user_id = :1 AND name = :2", self.user.user_id(),name).get()
-        if model is not None:
-            result['status'] = False
-            result['msg'] = 'A job with that name already exists. You need to input a unique name.'
-        
-        # Make sure that the simulation time is a numeric value greater than 0
-        try:
-            endtime = float(par['time'])
-            assert endtime > 0.0
-        except:
-            result['status'] = False
-            result['msg'] =  result['msg']+'\nThe simulation end time must be a positive number greater than zero'
-        
-        # Make sure that the increment is a positive number
-        try:
-            increment = float(par['increment'])
-            assert increment > 0.0
-        except:
-            result['status'] = False
-            result['msg'] =  result['msg']+'\nThe output sampling times must be positive numbers greater than zero.'
-        
-        # Make sure that the number of relalizations is an integer value greater than or equal to 1
-        try:
-           realizations = int(par['realizations'])
-           assert realizations >=1
-        except:
-            result['status'] = False
-            result['msg'] =  result['msg']+'\nThe number of realizations must be positive integer greater than zero.'
-                
-        # Check the seed, needs to be a numeric value
-        try:
-            if par['seed']=="":
-                # Bootstrap StochKit RNG with a random int
-                seed = random.randrange(0,1000000)
-                logging.info('SEED: '+str(seed))
-                par['seed'] = str(seed)
-            else:
-                seed = float(par['seed'])
-            assert seed >= 0
-        except Exception,e:
-            result['status'] = False
-            result['msg'] =  result['msg']+'\nThe seed must be a positive number.' + str(e)
-
-        # Check epsilon, needs to be a numeric value between 0 and one
-        try:
-            epsilon = float(par['epsilon'])
-            assert epsilon > 0.0 and epsilon < 1.0
-        except:
-            result['status'] = False
-            result['msg'] =  result['msg']+'\n Epsilon must be a number in (0,1)'
-
-        # TODO: Check with Sheng what numbers are valid for the threshold
-
-        return par,result
-    
-    def runStochKitLocal(self):
-        """ Submit a local StochKit job """
-        try:
-            # Get the model that is currently in scope for simulation via the session property 'model_to_simulate'
-            try:
-                model_to_simulate=self.get_session_property('model_to_simulate')
-                db_model = db.GqlQuery("SELECT * FROM StochKitModelWrapper WHERE user_id = :1 AND model_name = :2", self.user.user_id(),model_to_simulate).get()
-                model = db_model.model
-            except:
-                return {'status':False,'msg':'Failed to retrive the model to simulate.'}
-            
-            # Check the data from the form for errors
-            params,result = self.parseForm()
-            if not result['status']:
-                return result
-        
-            #the parameter dictionary to be passed to the backend
-            param = {}
-            
-            # Write a temporary StochKit2 input file.
-            document = model.serialize()
-            params['document'] = str(document)
-            ensemblename = params['job_name']
-            time = params['time']
-            realizations = params['realizations']
-            increment = params['increment']
-            seed = params['seed']
-            # Algorithm, SSA or Tau-leaping?
-                
-            STOCHKIT_HOME = ""
-            env_variables = self.user_data.env_variables
-            if env_variables is not None:
-                env_variables = json.loads(env_variables)
+            if job.status == "Finished":
                 try:
-                    STOCHKIT_HOME = env_variables['STOCHKIT_HOME']
-                    os.environ['STOCHKIT_HOME']=STOCHKIT_HOME
-                except:
-                    pass
-            executable = STOCHKIT_HOME+'/' +params['algorithm']
+                    if (job.resource in backendservices.SUPPORTED_CLOUD_RESOURCES and job.output_stored == 'False') or (job.resource in backendservices.SUPPORTED_CLOUD_RESOURCES and job.outData is None):
+                        self.response.headers['Content-Type'] = 'application/json'
+                        self.response.write(json.dumps({ "status" : "Finished",
+                                                         "values" : [],
+                                                         "job" : JobManager.getJob(self, job.key().id())}))
+                        return
+                    else:
+                        outputdir = job.outData
+                        # Load all data from file in JSON format
+                        if indata['exec_type'] == 'stochastic':
+                            tid = self.request.get('tid')
+
+                            if tid != '' and tid != 'mean':
+                                outfile = '/result/trajectories/trajectory{0}.txt'.format(tid)
+
+                                vhandle = open(outputdir + outfile, 'r')
+                        
+                                values = { 'time' : [], 'trajectories' : {} }
+                                columnToList = []
+                                for i, line in enumerate(vhandle):
+                                    if i == 0:
+                                        names = line.split()
+                                        for name in names:
+                                            if name == 'time':
+                                                columnToList.append(values['time'])
+                                            else:
+                                                values['trajectories'][name] = [] # start a new timeseries for this name
+                                                columnToList.append(values['trajectories'][name]) # Store a reference here for future use
+                                    else:
+                                        for storage, value in zip(columnToList, map(float, line.split())):
+                                            storage.append(value)
+                                vhandle.close()
+                            else:
+                                outfile = '/result/stats/means.txt'
+
+                                vhandle = open(outputdir + outfile, 'r')
+
+                                values = { 'time' : [], 'trajectories' : {} }
+                                columnToList = []
+                                for i, line in enumerate(vhandle):
+                                    if i == 0:
+                                        names = line.split()
+                                        for name in names:
+                                            if name == 'time':
+                                                columnToList.append(values['time'])
+                                            else:
+                                                values['trajectories'][name] = [] # start a new timeseries for this name
+                                                columnToList.append(values['trajectories'][name]) # Store a reference here for future use
+                                    else:
+                                        for storage, value in zip(columnToList, map(float, line.split())):
+                                            storage.append(value)
+                                vhandle.close()
+                        else:
+                            outfile = '/result/output.txt'
+                            values = { 'time' : [], 'trajectories' : {} }
+
+                            #if not os.path.isfile(outputdir + outfile):
+
+                            vhandle = open(outputdir + outfile, 'r')
+
+                            columnToList = []
+                            for i, line in enumerate(vhandle):
+                                if i == 0:
+                                    continue
+                                elif i == 1:
+                                    names = line.split()
+                                    for name in names:
+                                        if name == 'time':
+                                            columnToList.append(values['time'])
+                                        else:
+                                            values['trajectories'][name] = [] # start a new timeseries for this name
+                                            columnToList.append(values['trajectories'][name]) # Store a reference here for future use
+                                elif i == 2:
+                                    continue
+                                elif i == 3:
+                                    for storage, value in zip(columnToList, map(float, line.split())):
+                                        storage.append(value)
+                                elif i == 4:
+                                    continue
+                                else:
+                                    for storage, value in zip(columnToList, map(float, line.split())):
+                                        storage.append(value)
+                            vhandle.close()
+
+                    self.response.headers['Content-Type'] = 'application/json'
+                    result = {"status" : "Finished",
+                              "values" : values,
+                              "job" : JobManager.getJob(self, job.key().id())}
+                    logging.debug("result = \n\n{}".format(result))
+                    self.response.write(json.dumps(result))
+                    return
+
+                except Exception as e:
+                    traceback.print_exc()
+                    job.status = "Failed"
+                    job.put()
+                    logging.error("Failed to parse output data. Assuming job failed and continuing")
+            
+            if job.status == "Failed":
+                self.response.headers['Content-Type'] = 'application/json'
+
+                stdout = ""
+                stderr = ""
+                
+                if job.outData is not None:
+                    if os.path.isfile(job.outData + '/stdout'):
+                        fstdoutHandle = open(job.outData + '/stdout', 'r')
+                    else:
+                        fstdoutHandle = open(job.outData + '/stdout.log', 'r')
+                    stdout = fstdoutHandle.read()
+                    fstdoutHandle.close()
+
+                    if os.path.isfile(job.outData + '/stderr'):
+                        fstderrHandle = open(job.outData + '/stderr', 'r')
+                    else:
+                        fstderrHandle = open(job.outData + '/stderr.log', 'r')
+                    stderr = fstderrHandle.read()
+                    fstderrHandle.close()
+
+                self.response.write(json.dumps({ "status" : "Failed",
+                                                 "job" : JobManager.getJob(self, job.key().id()),
+                                                 "stdout" : stdout,
+                                                 "stderr" : stderr}))
+            else:
+                self.response.headers['Content-Type'] = 'application/json'
+                self.response.write(json.dumps({ "status" : "asdfasfdfdsa" }))
+        else:
+            # Params is a dict that constains all response elements of the form
+            params = json.loads(self.request.get('data'))
+
+            self.response.headers['Content-Type'] = 'application/json'
+            job = db.GqlQuery("SELECT * FROM StochKitJobWrapper WHERE user_id = :1 AND name = :2",
+                              self.user.user_id(), params["jobName"].strip()).get()
+
+            if job != None:
+                self.response.write(json.dumps({"status" : False,
+                                                "msg" : "Job name must be unique"}))
+                return
+            
+            backend_services = backendservices(self.user_data)
+
+            # Create a stochhkit_job instance
+            try:
+                if params['resource'] == "local":
+                    job = self.runStochKitLocal(params)
+                elif params['resource'] == 'cloud':
+                    job = self.runCloud(params)
+                else:
+                    raise Exception("Unknown resource {0}".format(params["resource"]))
+                self.response.headers['Content-Type'] = 'application/json'
+                self.response.write(json.dumps( { "status" : True,
+                                                  "msg" : "Job launched",
+                                                  "id" : job.key().id() } ))
+            except Exception as e:
+                self.response.headers['Content-Type'] = 'application/json'
+                self.response.write(json.dumps( { "status" : False,
+                                                  "msg" : str(e) } ))
     
-            # Assemble the argument list
-            args = ''
-            #args+='--model '
-            #args+=filepath
-            #args+=' --out-dir '+outdir
-            args+=' -t '
-            args+=str(time)
-            num_output_points = str(int(float(time)/float(increment)))
-            args+=' -i ' + str(num_output_points)
+    def runCloud(self, params):
+        model = StochKitModelWrapper.get_by_id(params["id"]).createStochKitModel()
+
+        if not model:
+            raise Exception('Failed to retrive the model \'{0}\' to simulate'.format(params["id"]))
+
+        #the parameter dictionary to be passed to the backend
+        param = {}
+
+        # Execute as concentration or population?
+        exec_type = params['execType'].lower()
+
+        if exec_type not in ["deterministic", "stochastic"]:
+            raise Exception('exec_type must be concentration or population. Found \'{0}\''.format(exec_type))
+
+        if model.units.lower() == 'concentration' and exec_type.lower() == 'stochastic':
+            raise Exception('Concentration models cannot be executed Stochastically' )
+
+        executable = exec_type.lower()
+        document = model.serialize()
+
+        # Wow, what a hack
+
+        if executable == 'deterministic' and model.units.lower() == 'population':
+            model = StochMLDocument.fromString(document).toModel(model.name)
+
+            for reactionN in model.getAllReactions():
+                reaction = model.getAllReactions()[reactionN]
+                if reaction.massaction:
+                    if len(reaction.reactants) == 1 and reaction.reactants.values()[0] == 2:
+                        reaction.marate.setExpression(reaction.marate.expression + ' / 2')
+            
+        document = model.serialize()
+
+        params['document']=str(document)
+        filepath = ""
+        params['file'] = filepath
+        ensemblename = params['jobName']
+        stime = params['time']
+        realizations = params['realizations']
+        increment = params['increment']
+
+        if int(params['seed']) < 0:
+            random.seed()
+            params['seed'] = random.randint(0, 2147483647)
+
+        seed = params['seed']
+
+        # Assemble the argument list
+        args = ''
+        args+=' -t '
+        args+=str(stime)
+        num_output_points = str(int(float(stime)/float(increment)))
+        args+=' -i ' + str(num_output_points)
+        path = os.path.dirname(__file__)
+
+        # Algorithm, SSA or Tau-leaping?
+        if executable != 'deterministic':
+            params['job_type'] = 'stochkit'
+            executable = params['algorithm']
+            
             args+=' --realizations '
             args+=str(realizations)
             
@@ -410,55 +562,185 @@ class NewStochkitEnsemblePage(BaseHandler):
             # through the advanced options.
             if not "only-moments" in params:
                 args+=' --keep-trajectories'
-            
-            # For the visualizaton page to work, columns must be labeled with species names.
-            args+=' --label'
-            
+                
             if "keep-histograms" in params:
                 args+=' --keep-histograms'
-            
+                
             args+=' --seed '
             args+=str(seed)
-        
-            cmd = executable+' '+args
-        
-            # Create a StochKitJob instance
-            stochkit_job = StochKitJob(name=ensemblename, final_time=time, realizations=realizations,increment=increment,seed=seed,algorithm=executable)
-        
-            # Create the argument string
-            params['paramstring'] = cmd
-                    
-            # Call backendservices and execute StochKit
-            service = backendservices()
-            res = service.executeTaskLocal(params)
-            
-            if(res == None):
-                result = {'status':False,'msg':'Local execution failed. '}
-                return result
-        
-            stochkit_job.resource = 'Local'
-            stochkit_job.type = 'StochKit2 Ensemble'
-                    
-            stochkit_job.pid = res['pid']
-            stochkit_job.output_location = res['output']
-            stochkit_job.uuid = res['uuid']
-            stochkit_job.status = 'Running'
-            stochkit_job.stdout = res['stdout']
-            stochkit_job.stderr = res['stderr']
-            
-            # Create a wrapper to store the Job description in the datastore
-            stochkit_job_db = StochKitJobWrapper()
-            stochkit_job_db.user_id = self.user.user_id()
-            stochkit_job_db.name = stochkit_job.name
-            stochkit_job_db.stochkit_job = stochkit_job
-            stochkit_job_db.stdout = stochkit_job.stdout
-            stochkit_job_db.stderr = stochkit_job.stderr
-            stochkit_job_db.put()
-    
-            result = {'status':True,'msg':'Job submitted sucessfully'}
-            
-        except Exception,e:
-            result = {'status':False,'msg':'Local execution failed: '+str(e)}
-                
-        return result
+        else:
+            params['job_type'] = 'stochkit_ode'
+            executable = "stochkit_ode.py"
 
+        # Columns need to be labeled for visulatization page to work.  
+        args += ' --label'
+        
+        cmd = executable+' '+args
+        
+        params['paramstring'] = cmd
+        
+        bucketname = self.user_data.getBucketName()
+        params['bucketname'] = bucketname  
+        
+        params['user_id'] = self.user.user_id()       
+        
+        # Call backendservices and execute StochKit
+        service = backendservices(self.user_data)
+
+        cloud_result = service.submit_cloud_task(params)
+
+        if not cloud_result["success"]:
+            e = cloud_result["exception"]
+            raise Exception('Cloud execution failed: {0}'.format(e))
+            
+        celery_task_id = cloud_result["celery_pid"]
+        taskid = cloud_result["db_id"]
+
+        # Create a StochKitJob instance
+        job = StochKitJobWrapper()
+        job.resource = cloud_result['resource']
+        
+        # stochkit_job.uuid = res['uuid']
+            
+        
+        
+        job.user_id = self.user.user_id()
+        job.startTime = time.strftime("%Y-%m-%d-%H-%M-%S")
+        job.name = params['jobName']
+        job.modelName = model.name
+        #job.pid = taskid
+        job.celeryPID = celery_task_id
+        job.cloudDatabaseID = taskid
+
+        # Create a StochKitJob instance
+        job.indata = json.dumps({ "type" : 'StochKit2 Ensemble',
+                                  "final_time" : params['time'],
+                                  "realizations" : params['realizations'],
+                                  "increment" : params['increment'],
+                                  "seed" : params['seed'],
+                                  "exec_type" : params['execType'],
+                                  "units" : model.units.lower(),
+                                  "epsilon" : params['epsilon'],
+                                  "threshold" : params['threshold'] })
+
+        job.output_stored = 'True'
+        job.outData = None
+        #job.stdout = '{0}/stdout'.format(dataDir)
+        #job.stderr = '{0}/stderr'.format(dataDir)
+        job.status = 'Running'
+        job.put()
+
+        return job
+
+    def runStochKitLocal(self, params):
+        """ Submit a local StochKit job """
+        modelDb = StochKitModelWrapper.get_by_id(params["id"])
+
+        if not modelDb:
+            return {'status':False,
+                    'msg':'Failed to retrive the model to simulate.'}
+
+        model = modelDb.createStochKitModel()
+
+        # Execute as concentration or population?
+        execType = params['execType'].lower()
+        
+        if execType not in ["deterministic", "stochastic", "sensitivity"]:
+            raise Exception('exec_type must be deterministic, sensitivity, or stochastic. Found "{0}"'.format(execType))
+            
+        if model.units.lower() == 'concentration' and execType.lower() == 'stochastic':
+            raise Exception('Concentration models cannot be executed stochastically')
+
+        # Assemble the argument list
+        args = ''
+        args += ' -t {0} '.format(params['time'])
+        num_output_points = int(float(params['time'])/float(params['increment']))
+        args += ' -i {0} '.format(num_output_points)
+        path = os.path.abspath(os.path.dirname(__file__))
+        # Algorithm, SSA or Tau-leaping?
+        if params['execType'] != 'deterministic':
+            executable = "{0}/../../StochKit/{1}".format(path, params['algorithm'])
+
+            args += ' --realizations {0} '.format(params['realizations'])
+            args += ' --keep-trajectories '
+
+            if int(params['seed']) < 0:
+                random.seed()
+                params['seed'] = random.randint(0, 2147483647)
+
+            args += '--seed {0} '.format(params['seed'])
+        else:
+            executable = "{0}/../../ode/stochkit_ode.py".format(path)
+
+        # Columns need to be labeled for visulatization page to work.  
+        args += ' --label'
+        
+        cmd = executable + ' ' + args
+        
+        basedir = path + '/../'
+        dataDir = tempfile.mkdtemp(dir = basedir + 'output')
+        
+        # Wow, what a hack
+        if params['execType'] == 'deterministic' and model.units.lower() == 'population':
+            document = model.serialize()
+
+            model = StochMLDocument.fromString(document).toModel(model.name)
+
+            for reactionN in model.getAllReactions():
+                reaction = model.getAllReactions()[reactionN]
+                if reaction.massaction:
+                    if len(reaction.reactants) == 1 and reaction.reactants.values()[0] == 2:
+                        reaction.marate.setExpression(reaction.marate.expression + ' / 2')
+
+        modelFileName = '{0}/{1}.xml'.format(dataDir, model.name)
+        fmodelHandle = open(modelFileName, 'w')
+        fmodelHandle.write(model.serialize())
+        fmodelHandle.close()
+
+        cmd += ' -m {0} --out-dir {1}/result'.format(modelFileName, dataDir)
+
+        logging.info("cmd =\n{}".format(cmd))
+        logging.debug('simulation.runLocal(): cmd={0}'.format(cmd))
+        logging.debug('*'*80)
+        logging.debug('*'*80)
+
+        #ode = "{0}/../../ode/stochkit_ode.py {1}".format(path, args)
+        exstring = '{0}/backend/wrapper.py {1}/stdout {1}/stderr {1}/return_code {2}'.format(basedir, dataDir, cmd)
+
+        logging.debug('simulation.runLocal(): exstring={0}'.format(exstring))
+        logging.debug('*'*80)
+        logging.debug('*'*80)
+        handle = subprocess.Popen(exstring.split(), preexec_fn=os.setsid)
+
+        # Create a wrapper to store the Job description in the datastore
+        job = StochKitJobWrapper()
+        job.resource = 'Local'
+        
+        # stochkit_job.uuid = res['uuid']
+            
+        
+        
+        job.user_id = self.user.user_id()
+        job.startTime = time.strftime("%Y-%m-%d-%H-%M-%S")
+        job.name = params['jobName']
+        job.modelName = model.name
+        job.pid = handle.pid
+
+        # Create a StochKitJob instance
+        job.indata = json.dumps( { "type" : 'StochKit2 Ensemble',
+                                   "final_time" : params['time'],
+                                   "realizations" : params['realizations'],
+                                   "increment" : params['increment'],
+                                   "seed" : params['seed'],
+                                   "exec_type" : params['execType'],
+                                   "units" : model.units.lower(),
+                                   "epsilon" : params['epsilon'],
+                                   "threshold" : params['threshold'] } )
+
+        job.outData = dataDir
+        job.stdout = '{0}/stdout'.format(dataDir)
+        job.stderr = '{0}/stderr'.format(dataDir)
+        job.status = 'Running'
+        job.put()
+            
+        return job

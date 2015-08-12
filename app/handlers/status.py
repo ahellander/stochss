@@ -11,16 +11,26 @@ import time
 import shutil
 import os
 import subprocess
+import tempfile
+import datetime
+import pprint
 
 from google.appengine.ext import db
 
 from stochssapp import BaseHandler
 from backend.backendservice import backendservices
+from backend.common.config import AgentTypes, JobDatabaseConfig
+
+import sensitivity
+import simulation
+import spatial
+import stochoptim
 
 class StatusPage(BaseHandler):
     """ The main handler for the Job Status Page. Displays status messages for the jobs, options to delete/kill jobs and
-        options to view the Job metadata and Job results. """
-    
+        options to view the Job metadata and Job results. """        
+    def authentication_required(self):
+        return True
     
     def get(self):
         context = self.getContext()
@@ -35,38 +45,17 @@ class StatusPage(BaseHandler):
             # The jobs to delete are specified in the checkboxes
             jobs_to_delete = params.getall('select_job')
         
-            service = backendservices()
+            service = backendservices(self.user_data)
 
             # Select the jobs to delete from the datastore
             result = {}
             for job_name in jobs_to_delete:
                 try:
                     job = db.GqlQuery("SELECT * FROM StochKitJobWrapper WHERE user_id = :1 AND name = :2", self.user.user_id(),job_name).get()
-                    stochkit_job = job.stochkit_job
                 except Exception,e:
                     result = {'status':False,'msg':"Could not retrieve the jobs"+job_name+ " from the datastore."}
         
-                # TODO: Call the backend to kill and delete the job and all associated files.
-                try:
-                    if stochkit_job.resource == 'Local':
-                        service.deleteTaskLocal([stochkit_job.pid])
-                    else:
-                        service.deleteTasks([stochkit_job.pid])
-                    isdeleted_backend = True
-                except Exception,e:
-                    isdeleted_backend = False
-                    result['status']=False
-                    result['msg'] = "Failed to delete task with PID " + str(stochkit_job.pid) + str(e)
-                        
-                if isdeleted_backend:
-                    # Delete all the local files and delete the job from the datastore
-                    try:
-                        # We remove the local entry of the job output directory
-                        if os.path.exists(stochkit_job.output_location):
-                            shutil.rmtree(stochkit_job.output_location)
-                        db.delete(job)
-                    except Exception,e:
-                        result = {'status':False,'msg':"Failed to delete job "+job_name+str(e)}
+                job.delete()
     
             # Render the status page 
             # AH: This is a hack to prevent the page from reloading before the datastore transactions
@@ -93,306 +82,190 @@ class StatusPage(BaseHandler):
             with info to display on the page. 
         """
         context = {}
-        result = {}
-        service = backendservices()
-        # Grab references to all the user's StochKitJobs in the system
+        service = backendservices(self.user_data)
+        # StochKit jobs
         all_stochkit_jobs = db.GqlQuery("SELECT * FROM StochKitJobWrapper WHERE user_id = :1", self.user.user_id())
-        if all_stochkit_jobs == None:
-            context['no_jobs'] = 'There are no jobs in the system.'
-        else:
-            # We want to display the name of the job and the status of the Job.
-            all_jobs = []
-            status = {}
-            
-            for job in all_stochkit_jobs.run():
-                
-                # Get the job id
-                stochkit_job = job.stochkit_job
-                
-                # Query the backend for the status of the job, but only if the current status is not Finished
-                if not stochkit_job.status == "Finished":
-                    try:
-                        if stochkit_job.resource == 'Local':
-                            # First, check if the job is still running
-                            res = service.checkTaskStatusLocal([stochkit_job.pid])
-                            if res[stochkit_job.pid]:
-                                stochkit_job.status = "Running"
-                            else:
-                                # Check if the stats/means.txtis present, that will always be the case for a sucessful job.
-                                if os.path.exists(stochkit_job.output_location+"/result/stats/means.txt"):
-                                    stochkit_job.status = "Finished"
-                                else:
-                                    stochkit_job.status = "Failed"
-                
-                        elif stochkit_job.resource == 'Cloud':
-                            # Retrive credentials from the datastore
-                            if not self.user_data.valid_credentials:
-                                return {'status':False,'msg':'Could not retrieve the status of job '+stochkit_job.name +'. Invalid credentials.'}
-                            credentials = self.user_data.getCredentials()
-
-                            # Check the status on the remote end
-                            taskparams = {'AWS_ACCESS_KEY_ID':credentials['EC2_ACCESS_KEY'],'AWS_SECRET_ACCESS_KEY':credentials['EC2_SECRET_KEY'],'taskids':[stochkit_job.pid]}
-                            task_status = service.describeTask(taskparams)
-                            job_status = task_status[stochkit_job.pid]
-                            # It frequently happens that describeTasks return None before the job is finsihed.
-                            if job_status == None:
-                                stochkit_job.status = "Unknown"
-                            else:
-
-                                if job_status['status'] == 'finished':
-                                    # Update the stochkit job 
-                                    stochkit_job.status = 'Finished'
-                                    stochkit_job.output_url = job_status['output']
-                                    stochkit_job.uuid = job_status['uuid']
-                                
-                                elif job_status['status'] == 'Failed':
-                                    stochkit_job.status == 'Failed'
-                                elif job_status['status'] == 'pending':
-                                    stochkit_job.status = 'Pending'
-                                else:
-                                    # The state gives more fine-grained results, like if the job is being re-run, but
-                                    #  we don't bother the users with this info, we just tell them that it is still running.  
-                                    stochkit_job.status == 'Running'
-                    
-                    except Exception,e:
-                        result = {'status':False,'msg':'Could not determine the status of the jobs.'+str(e)}
-                
-                all_jobs.append(stochkit_job)
-                # Save changes to the status
-                job.put()
-                
+        all_jobs = []
+        if all_stochkit_jobs != None:
+            jobs = list(all_stochkit_jobs.run())
+            jobs = sorted(jobs,
+                          key=lambda x:
+                                (datetime.datetime.strptime(x.startTime, '%Y-%m-%d-%H-%M-%S')
+                                     if hasattr(x, 'startTime') and x.startTime != None else datetime.datetime.now()),
+                          reverse=True)
+            for number, job in enumerate(jobs):
+                number = len(jobs) - number
+                all_jobs.append(self.__process_getJobStatus(service,job, number))
         context['all_jobs']=all_jobs
+
+        # Sensitivity
+        allSensJobs = []
+        allSensQuery = db.GqlQuery("SELECT * FROM SensitivityJobWrapper WHERE user_id = :1", self.user.user_id())
+        if allSensQuery != None:
+            jobs = list(allSensQuery.run())
+            jobs = sorted(jobs,
+                          key=lambda x:
+                                (datetime.datetime.strptime(x.startTime, '%Y-%m-%d-%H-%M-%S')
+                                 if hasattr(x, 'startTime') and x.startTime != None else ''),
+                          reverse = True)
+            for number, job in enumerate(jobs):
+                number = len(jobs) - number
+                allSensJobs.append(self.__process_getJobStatus(service,job, number))
+        context['allSensJobs']=allSensJobs
+
+
+        # Export
+        allExportJobs = []
+        exportJobsQuery = db.GqlQuery("SELECT * FROM ExportJobWrapper WHERE user_id = :1", self.user.user_id())
+        if exportJobsQuery != None:
+            jobs = list(exportJobsQuery.run())
+            jobs = sorted(jobs, key = lambda x : (datetime.datetime.strptime(x.startTime, '%Y-%m-%d-%H-%M-%S') if hasattr(x, 'startTime') and x.startTime != None else ''), reverse = True)
+            for number, job in enumerate(jobs):
+                number = len(jobs) - number
+                allExportJobs.append({ "startTime" : job.startTime,
+                                       "status" : job.status,
+                                       "number" : number,
+                                       "outData" : os.path.basename(job.outData if job.outData else ""),
+                                       "id" : job.key().id()})
+        context['allExportJobs'] = allExportJobs
+
+        # Parameter Estimation
+        allParameterJobs = []
+        allParameterJobsQuery = db.GqlQuery("SELECT * FROM StochOptimJobWrapper WHERE user_id = :1", self.user.user_id())
+        if allParameterJobsQuery != None:
+            jobs = list(allParameterJobsQuery.run())
+            jobs = sorted(jobs, key = lambda x : (datetime.datetime.strptime(x.startTime, '%Y-%m-%d-%H-%M-%S') if hasattr(x, 'startTime') and x.startTime != None else ''), reverse = True)
+            for number, job in enumerate(jobs):
+                number = len(jobs) - number
+                allParameterJobs.append(self.__process_getJobStatus(service,job, number))
+        context['allParameterJobs'] = allParameterJobs
+
+        #Spatial Jobs
+        allSpatialJobs = []
+        allSpatialJobsQuery = db.GqlQuery("SELECT * FROM SpatialJobWrapper WHERE user_id = :1", self.user.user_id())
+        if allSpatialJobsQuery != None:
+            jobs = list(allSpatialJobsQuery.run())
+            jobs = sorted(jobs,
+                          key=lambda x : (datetime.datetime.strptime(x.startTime, '%Y-%m-%d-%H-%M-%S')
+                                              if hasattr(x, 'startTime') and x.startTime != None else ''),
+                          reverse = True)
+            for number, job in enumerate(jobs):
+                number = len(jobs) - number
+                allSpatialJobs.append(self.__process_getJobStatus(service,job, number))
+        context['allSpatialJobs'] = allSpatialJobs
     
-        return dict(result,**context)
+        return context
 
-    def getJobStatus(self,task_id):
-        # TODO: request the status from the backend.
-        return True
-
-    def get_all_urls(self):
-        """
-            Get the URLs of 
-        """
-        model = self.get_session_property('model_edited')
-        if model is None:
-            return None
-        else:
-        	result = backendservice.describeTask(valid_username)
-		self.render_response('status.html', **result)
-
-
-class JobOutPutPage(BaseHandler):
-
-    def get(self):
-        context,result = self.getContext()
-        self.render_response('stochkitjoboutputpage.html',**dict(result,**context))
-
-    def post(self):
-        context,result = self.getContext()
-        result = {}
-        
-        if 'fetch_remote' in context:
-            
-            logging.info("FETCHING REMOTE FILES")
-            
-            # Grab the Job from the datastore
-            job_name = context['job_name']
-            try:
-                job = db.GqlQuery("SELECT * FROM StochKitJobWrapper WHERE user_id = :1 AND name = :2", self.user.user_id(),job_name).get()
-                stochkit_job = job.stochkit_job
-                context['stochkit_job']=stochkit_job
-            except Exception,e:
-                result = {'status':False,'msg':"Could not retreive the jobs" +job_name+ " from the datastore."}
-
-            try:
-                
-                # Grab the remote files
-                service = backendservices()
-                service.fetchOutput(stochkit_job.pid,stochkit_job.output_url)
-                
-                # Unpack it to its local output location
-                os.system('tar -xf' +stochkit_job.uuid+'.tar')
-                stochkit_job.output_location = os.path.abspath(os.path.dirname(__file__))+'/../output/'+stochkit_job.uuid
-                stochkit_job.output_location = os.path.abspath(stochkit_job.output_location)
-                
-                # Clean up
-                os.remove(stochkit_job.uuid+'.tar')
-                
-                # Save the updated status
-                job.put()
-                
-                result['status']=True
-                result['msg'] = "Sucessfully fetched the remote output files."
-                
-            except Exception,e:
-                result['status']=False
-                result['msg'] = "Failed to fetch the remote files."
-                    
-            # Check if the results and stats folders are present locally
-            if os.path.exists(stochkit_job.output_location+"/result"):
-                context['local_data']=True
-            if os.path.exists(stochkit_job.output_location+"/result/stats"):
-                context['local_statistics']=True
-                        
-            self.render_response('stochkitjoboutputpage.html',**dict(result,**context))
-            
-    def getContext(self):
-        
-        context = self.request.POST
-        context = dict(context,**self.request.GET)
-
-        job_name = context['job_name']
-
-        # Detect if we should show the 'debug' version of the output
-        if 'debug' in context:
-          debug = (context['debug'] == 'true')
-          context['debug'] = debug #Store a copy for the django templates
-        else:
-          debug = False
-
-        result = {}
-        
-        # Grab the Job from the datastore
+    def __process_getJobStatus(self,service,job,number):
         try:
-            job = db.GqlQuery("SELECT * FROM StochKitJobWrapper WHERE user_id = :1 AND name = :2", self.user.user_id(),job_name).get()
-            stochkit_job = job.stochkit_job
-            context['stochkit_job']=stochkit_job
-        except Exception,e:
-            result = {'status':False,'msg':"Could not retreive the jobs"+job_name+ " from the datastore."}
+            status = getJobStatus(service, job)
+        except Exception as e:
+            status = {  "status" : 'Error: {0}'.format(e),
+                        "name" : job.name,
+                        "uuid" : job.cloudDatabaseID,
+                        "output_stored": None,
+                        "resource": 'Error',
+                        "id" : job.key().id()}
+        status['number'] = number
+        return status
 
-        # If not in debug mode, show the output
-        if debug == False:
-          # Check if the results and stats folders are present locally
-          if os.path.exists(stochkit_job.output_location+"/result"):
-            context['local_data']=True
-          if os.path.exists(stochkit_job.output_location+"/result/stats"):
-            context['local_statistics']=True
-        else:
-          # If in debug mode, show the stdout and stderr along with jobinfo
-          if os.path.exists(stochkit_job.output_location):
-            stdoutf = open(context['stochkit_job'].stdout, 'r')
-            context['stdout'] = stdoutf.read()
-            stdoutf.close()
 
-            stderrf = open(context['stochkit_job'].stderr, 'r')
-            context['stderr'] = stderrf.read()
-            stderrf.close()
-          else:
-            # Should never get here
-            pass
-            
-        return context,result
+def getJobStatus(service, job):
+        logging.debug('status.getJobStatus() job = {0}'.format(job))
+        logging.debug('status.getJobStatus() job.status={0} job.resource={1} job.outData={2}'.format(job.status, job.resource, job.outData))
+        indata = json.loads(job.indata)
+        file_to_check = "{0}/return_code".format(job.outData)
+        logging.debug('status.getJobStatus() file_to_check={0}'.format(file_to_check))
+        logging.debug('status.getJobStatus() job.outData={0}'.format(job.outData))
+        if job.resource is None:
+            return { "status" : 'Error',
+                    "name" : job.name,
+                    "uuid" : job.cloudDatabaseID,
+                    "output_stored": None,
+                    "resource": None,
+                    "id" : job.key().id()}
 
-class VisualizePage(BaseHandler):
-    """ Basic Visualization """
-
-    def get(self):
-        
-        result = {}
-        context = self.getContext()
-        logging.info(context)
+        return_code = None
         try:
-            # Get the species names
-            species_names = self.getSpeciesNames(context)
-            if species_names == None:
-                result['status'] = False
-                result['msg'] = 'Failed to retrive the species names'
-            context['species_names'] = species_names
-    
-        except Exception,e:
-            self.response.out.write(str(e))
-        pass
-        
-        context['trajectory_number']="1"
-        self.render_response('visualizepage.html',**dict(result,**context))
-    
-    def post(self):
-        # TODO: Error handling
-        
-        result = {}
-        context = self.getContext()
-        logging.info(context)
-        params = self.request.POST
-        
-        # Get the species names
-        species_names = self.getSpeciesNames(context)
-        if species_names == None:
-            result['status'] = False
-            result['msg'] = 'Failed to retrive the species names'
-        context['species_names'] = species_names
-        
-        trajectory_number = context['trajectory_number']
-        species_name = context['species_name']
-        if 'plotbuttonmean' in params:
-            species_time_series = self.getMeans(context,species_name)
-        elif 'plotbutton' in params:
-            species_time_series = self.getTrajectory(context,trajectory_number,species_name)
-        context['species_time_series']=species_time_series
-            
-        self.render_response('visualizepage.html',**dict(result,**context))
-    
-    def getMeans(self, params, species_name):
-        """ Get the mean values """
-        try:
-            # StochKit labels the output files starting from 0, hence the "-1", since we label from 1 in the UI.
-            meanfile = params['job_folder']+'/result/stats/means.txt'
-            file = open(meanfile,'rb')
-            trajectory_data = [row.strip().split('\t') for row in file]
-            
-            species_names = trajectory_data[0]
-            for s in range(len(species_names)):
-                if species_names[s] == species_name:
-                    break
-            species_time_series = []
-            for row in trajectory_data:
-                species_time_series.append([row[0],row[s]]);
-            return species_time_series[1:]
-        except:
-            return None
-
-    
-    def getTrajectory(self, params, trajectory_number, species_name):
-        """ Get data from a specific trajectory in the StochKit output folder. """
-
-        try:
-            # StochKit labels the output files starting from 0, hence the "-1", since we label from 1 in the UI.
-            meanfile = params['job_folder']+'/result/trajectories/trajectory'+str(int(trajectory_number)-1)+'.txt'
-            file = open(meanfile,'rb')
-            trajectory_data = [row.strip().split('\t') for row in file]
-            
-            species_names = trajectory_data[0]
-            for s in range(len(species_names)):
-                if species_names[s] == species_name:
-                    break
-            species_time_series = []
-            for row in trajectory_data:
-                species_time_series.append([row[0],row[s]]);
-            return species_time_series[1:]
-        except:
-            return None
-            
-    def getSpeciesNames(self,params):
-        """ Get a list with the species names. 
-            The result folder have to be populated in advance. """
-        meanfile = params['job_folder']+'/result/stats/means.txt'
-        logging.info(str(meanfile))
-        try:
-            # Try to grab them from the mean.txt file
-            meanfile = params['job_folder']+'/result/stats/means.txt'
-            file = open(meanfile,'rb')
-            row = file.readline()
-            logging.info(str(row))
-            species_names = row.strip().split('\t')
-            file.close()
-        except Exception, e:
-            logging.info(str(e))
-            return None
+            if os.path.exists(file_to_check):
+                with open(file_to_check, 'r') as fd:
+                    line = fd.readline().strip()
                 
-        # The first value is always 'time' 
-        return species_names[1:]
+                    if len(line) > 0:
+                        return_code = int(line)
+        except Exception as e:
+            logging.exception(e)
+            job.status = "Failed"
+            
 
-    def getContext(self):
-        params = self.request.POST
-        params = dict(params,**self.request.GET)
-        return params
-    
+        if job.outData is not None and return_code is not None:
+            # job finished
+            logging.debug('status.getJobStatus() file_to_check={0} return_code={1}'.format(file_to_check, return_code))
+            if return_code == 0:
+                job.status = "Finished"
+            else:
+                job.status = "Failed"
+        elif job.resource.lower() == "local":
+            # running Locally
+            # check if the job is still running
+            res = service.checkTaskStatusLocal([job.pid])
+            if res[job.pid] and job.pid:
+                job.status = "Running"
+            else:
+                job.status = "Failed"
+
+
+        elif job.resource in backendservices.SUPPORTED_CLOUD_RESOURCES:
+            # running in cloud
+            task_status = service.describeTasks(job)
+            logging.info('status.getJobStatus()  task_status =\n{}'.format(pprint.pformat(task_status)))
+
+            if task_status is None:
+                job.status = "Inaccessible"
+                logging.debug("status.getJobStatus() job.status = {0}".format(job.status))
+                job_status = None
+            elif task_status is not None and job.cloudDatabaseID not in task_status:
+                job.status = "Unknown"
+                logging.debug("status.getJobStatus() job.status = {0}".format(job.status))
+            else:
+                job_status = task_status[job.cloudDatabaseID]
+                if job_status is None or 'status' not in job_status:
+                    job.status = "Unknown"
+                    logging.debug("status.getJobStatus() job.status = {0}".format(job.status))
+                elif job_status['status'] == 'finished':
+                    job.outputURL = job_status['output']
+                    job.uuid = job_status['uuid']
+                    job.status = 'Finished'
+                    logging.debug("status.getJobStatus() job.status = {0}".format(job.status))
+
+                elif job_status['status'] == 'failed':
+                    job.status = 'Failed'
+                    logging.debug("status.getJobStatus() job.status = {0}".format(job.status))
+                    job.exception_message = job_status['message']
+                    # Might not have a uuid or output if an exception was raised early on or if there is just no output available
+                    try:
+                        job.uuid = job_status['uuid']
+                        job.outputURL = job_status['output']
+                    except KeyError:
+                        pass
+
+                elif job_status['status'] == 'pending':
+                    job.status = 'Pending'
+                    logging.debug("status.getJobStatus() job.status = {0}".format(job.status))
+                else:
+                    # The state gives more fine-grained results, like if the job is being re-run, but
+                    #  we don't bother the users with this info, we just tell them that it is still running.
+                    job.status = 'Running'
+                    logging.debug("status.getJobStatus() job.status = {0}".format(job.status))
+
+        job.put()
+        
+         
+
+        return {    "status" : job.status,
+                    "name" : job.name,
+                    "uuid" : job.cloudDatabaseID,
+                    "output_stored": job.output_stored if hasattr(job, 'output_stored') else None,
+                    "resource": job.resource,
+                    "id" : job.key().id()}
+
